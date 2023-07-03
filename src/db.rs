@@ -5,6 +5,7 @@ use bytes::Bytes;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use tracing::debug;
+use zset::skip_list_set::SkipListSet;
 
 /// A wrapper around a `Db` instance. This exists to allow orderly cleanup
 /// of the `Db` by signalling the background purge task to shut down when
@@ -62,6 +63,8 @@ struct State {
     /// The key-value data. We are not trying to do anything fancy so a
     /// `std::collections::HashMap` works fine.
     entries: HashMap<String, Entry>,
+
+    sorted_sets: HashMap<String, SkipListSet<String, f64>>,
 
     /// The pub/sub key-space. Redis uses a **separate** key space for key-value
     /// and pub/sub. `mini-redis` handles this by using a separate `HashMap`.
@@ -124,6 +127,7 @@ impl Db {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 entries: HashMap::new(),
+                sorted_sets: HashMap::new(),
                 pub_sub: HashMap::new(),
                 expirations: BTreeSet::new(),
                 shutdown: false,
@@ -211,6 +215,35 @@ impl Db {
             // its state to reflect a new expiration.
             self.shared.background_task.notify_one();
         }
+    }
+
+    pub(crate) fn zadd(&self, key: String, member: String, score: f64) -> usize {
+        let mut state = self.shared.state.lock().unwrap();
+        let mut count = 0;
+        if let Some(set) = state.sorted_sets.get_mut(&key) {
+            if set.insert(member, score) {
+                count += 1;
+            }
+        } else {
+            let mut set = SkipListSet::new();
+            set.insert(member, score);
+            count += 1;
+            state.sorted_sets.insert(key, set);
+        }
+
+        drop(state);
+        count
+    }
+
+    pub(crate) fn zscore(&self, key: String, member: String) -> Option<String> {
+        let state = self.shared.state.lock().unwrap();
+        let result = state
+            .sorted_sets
+            .get(&key)
+            .and_then(|set| set.get(&member))
+            .map(f64::to_string);
+        drop(state);
+        result
     }
 
     /// Returns a `Receiver` for the requested channel.
